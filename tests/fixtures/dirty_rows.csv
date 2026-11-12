@@ -1,0 +1,17 @@
+ID,Age,Gender,Country,Coffee_Intake,Caffeine_mg,Sleep_Hours,Sleep_Quality,BMI,Heart_Rate,Stress_Level,Physical_Activity_Hours,Health_Issues,Occupation,Smoking,Alcohol_Consumption
+900001,40,Male,Germany,3.5,328.1,7.5,Good,24.9,78,Low,14.5,None,Other,0,0
+900001,40,Male,Germany,3.5,328.1,7.5,Good,24.9,78,Low,14.5,None,Other,0,0
+900002,30,Female,France,2.0,190.0,7.0,Excellent,22.0,65,High,5.0,Severe,Healthcare,0,1
+900002,31,Female,France,2.0,190.0,7.0,Excellent,22.0,65,High,5.0,Severe,Healthcare,0,1
+900003,33," male "," south korea ",1.0,94.1,6.2," good ",20.0,67," LOW ",11.0," none "," office ",0,0
+900004,42,Male,Brazil,"7,5","712,5 mg",6.8,Fair,22.7,59,Medium,11.2,Mild,Office,0,0
+900005,50,MALE,USA,2.0,190.0,7.0,Excellent,22.0,65,High,5.0,Severe,Healthcare,YES,no
+900006,30,Male,Spain,3.0,285.0,-1,Good,23.0,70,Low,8.0,None,Student,0,0
+900007,thirty,Male,Italy,2.0,190.0,7.0,Good,22.0,65,Low,5.0,None,Other,0,0
+900008,30,Male,Canada,2.0,190.0,7.0,Good,22.0,65,Low,5.0,None,Other,-1,0
+900009,30,Male,Canada,0,400.0,7.0,Good,22.0,65,Low,5.0,None,Other,0,0
+900010,30,Female,Canada,0,4.0,7.0,Good,22.0,65,Low,5.0,None,Other,0,0
+900011,30,?,Japan,2.0,190.0,7.0,Good,22.0,65,Low,5.0,None,Other,0,0
+900012,212,Male,Japan,2.0,190.0,7.0,Good,22.0,65,Low,5.0,None,Other,0,0
+900013,30,Male,Japan,2.0,190.0,7.0,Good,22.0,65,Low,5.0,None,Other,0,0,extra
+900014,30,Male,Japan,2.0,190.0,7.0,Good,22.0,65,Low,5.0,None,Other

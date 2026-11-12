@@ -12,6 +12,9 @@ __pycache__/
 .env.*
 !.env.example
 
+# Generated loader output
+data/rejected_rows.jsonl
+
 # OS / editors
 .DS_Store
 .idea/
