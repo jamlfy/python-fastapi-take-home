@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import psycopg
 from psycopg import Connection, sql
 from psycopg.rows import DictRow, dict_row
+from psycopg.types.json import Jsonb
 
 from app.coffee.constants import COLUMNS
 from app.config import settings
@@ -154,6 +155,163 @@ class ImportCheckpoint:
 
     def close(self) -> None:
         self.conn.close()
+
+
+class CoffeeBlockWriter:
+    """Commit ordered CSV blocks using COPY and set-based classification."""
+
+    def __init__(self, checkpoint: ImportCheckpoint) -> None:
+        self.checkpoint = checkpoint
+        self.conn = checkpoint.conn
+        self.source = checkpoint.source
+
+    def save_block(self, rows: list[tuple[int, ValidatedRecord]]) -> None:
+        """Isolate rare database data errors without losing the whole input block."""
+        if not rows:
+            return
+        try:
+            self._save_block(rows)
+        except (psycopg.DataError, psycopg.IntegrityError) as exc:
+            if len(rows) > 1:
+                middle = len(rows) // 2
+                self.save_block(rows[:middle])
+                self.save_block(rows[middle:])
+                return
+            seq, row = rows[0]
+            rejected: ValidatedRecord = (row[0], row[1], row[2], None, str(exc).strip())
+            self._save_block([(seq, rejected)])
+
+    def _save_block(self, rows: list[tuple[int, ValidatedRecord]]) -> None:
+        if not rows:
+            return
+        from app.coffee.loader import to_db_row
+
+        start, end = rows[0][0], rows[-1][0]
+        with self.conn.transaction():
+            self.conn.execute(
+                "create temp table _coffee_stage on commit drop as "
+                "select null::bigint seq, null::integer line, null::text raw, "
+                "null::text kind, null::text reason, null::boolean corrected, "
+                "null::jsonb first_row, h.* from coffee_health h with no data"
+            )
+            self.conn.execute(
+                "create temp table _coffee_result "
+                "(seq bigint primary key, line integer, kind text, corrected boolean, reason text) "
+                "on commit drop"
+            )
+            # A previous version may have committed worker batches beyond its checkpoint.
+            self.conn.execute(
+                "insert into _coffee_result "
+                "select seq,line,kind,corrected,reason from coffee_load_progress "
+                "where source=%s and seq between %s and %s",
+                (self.source, start, end),
+            )
+            columns = sql.SQL(", ").join(map(sql.Identifier, COLUMNS))
+            copy_sql = sql.SQL(
+                "copy _coffee_stage (seq,line,raw,kind,reason,corrected,first_row,{}) from stdin"
+            ).format(columns)
+            with self.conn.cursor().copy(copy_sql) as copy:
+                for seq, row in rows:
+                    line, fields, raw, normalized, error = row
+                    values: tuple[object, ...]
+                    if not fields:
+                        kind, values = "blank_lines", (None,) * len(COLUMNS)
+                    elif error or normalized is None:
+                        kind, values = "rejected", (None,) * len(COLUMNS)
+                    else:
+                        kind, values = "valid", to_db_row(normalized[0])
+                    first_row = Jsonb([str(value) for value in values]) if kind == "valid" else None
+                    copy.write_row(
+                        (
+                            seq,
+                            line,
+                            raw,
+                            kind,
+                            error,
+                            bool(normalized and normalized[1]),
+                            first_row,
+                            *values,
+                        )
+                    )
+            self.conn.execute(
+                "insert into _coffee_result "
+                "select s.seq,s.line,s.kind,s.corrected,s.reason from _coffee_stage s "
+                "where s.kind <> 'valid' and not exists "
+                "(select 1 from _coffee_result r where r.seq=s.seq)"
+            )
+            self.conn.execute(
+                "insert into coffee_load_reject(source,line,reason,raw) "
+                "select %s,line,reason,raw from _coffee_stage where kind='rejected' "
+                "on conflict(source,line) do update set reason=excluded.reason,raw=excluded.raw",
+                (self.source,),
+            )
+            self.conn.execute(
+                "create temp table _coffee_ranked on commit drop as "
+                "select s.*, p.first_row prior_row, "
+                "row_number() over(partition by s.id order by s.seq) row_rank, "
+                "first_value(s.first_row) over(partition by s.id order by s.seq) batch_first "
+                "from _coffee_stage s left join coffee_load_seen p "
+                "on p.source=%s and p.id=s.id "
+                "where s.kind='valid' and not exists "
+                "(select 1 from _coffee_result r where r.seq=s.seq)",
+                (self.source,),
+            )
+            self.conn.execute(
+                "insert into _coffee_result(seq,line,kind,corrected,reason) "
+                "select seq,line,case when first_row=coalesce(prior_row,batch_first) "
+                "then 'exact_duplicates' else 'conflicts' end,false,null "
+                "from _coffee_ranked where prior_row is not null or row_rank>1"
+            )
+            self.conn.execute(
+                "insert into coffee_load_seen(source,id,first_row) "
+                "select %s,id,first_row from _coffee_ranked "
+                "where prior_row is null and row_rank=1 on conflict do nothing",
+                (self.source,),
+            )
+            insert_columns = sql.SQL(", ").join(map(sql.Identifier, COLUMNS))
+            statement = sql.SQL(
+                "with inserted as (insert into coffee_health ({0}) "
+                "select {0} from _coffee_ranked where prior_row is null and row_rank=1 "
+                "on conflict(id) do nothing returning id) "
+                "insert into _coffee_result(seq,line,kind,corrected,reason) "
+                "select r.seq,r.line,case when i.id is null then 'already_loaded' "
+                "else 'loaded' end,r.corrected and i.id is not null,null "
+                "from _coffee_ranked r left join inserted i on i.id=r.id "
+                "where r.prior_row is null and r.row_rank=1"
+            ).format(insert_columns)
+            self.conn.execute(statement)
+            result = self.conn.execute(
+                "select seq,line,kind,corrected,reason from _coffee_result order by seq"
+            ).fetchall()
+            if len(result) != len(rows):
+                raise RuntimeError(f"incomplete block: {len(result)} of {len(rows)} records")
+            counts = self.checkpoint.counts.copy()
+            reasons = self.checkpoint.reasons.copy()
+            for item in result:
+                kind = item["kind"]
+                counts[kind] += 1
+                if kind != "blank_lines":
+                    counts["rows_read"] += 1
+                if item["corrected"]:
+                    counts["corrected"] += 1
+                if item["reason"]:
+                    reasons[item["reason"].split(":", 1)[0]] += 1
+            self.conn.execute(
+                "delete from coffee_load_progress where source=%s and seq between %s and %s",
+                (self.source, start, end),
+            )
+            self.conn.execute(
+                "update coffee_load_checkpoint set seq=%s,line=%s,counts=%s,reasons=%s "
+                "where source=%s",
+                (end, result[-1]["line"], json.dumps(counts), json.dumps(reasons), self.source),
+            )
+        self.checkpoint.seq = end
+        self.checkpoint.line = result[-1]["line"]
+        self.checkpoint.counts = counts
+        self.checkpoint.reasons = reasons
+
+    def close(self) -> None:
+        pass
 
 
 class CoffeeBatchWriter:

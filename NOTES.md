@@ -40,6 +40,25 @@ reanudarla. No regenerar ni modificar el archivo antes de reanudar, porque la
 firma del archivo debe coincidir con la del punto de control. Para una prueba
 rápida, usar `make large-example COUNT=10000` y luego `make load-large`.
 
+### Carga por bloques y medición
+
+La implementación actual valida registros en orden, copia cada bloque de
+10.000 filas a una tabla temporal con `COPY` y clasifica duplicados, conflictos
+e inserciones con SQL de conjunto. Cada bloque y su checkpoint se confirman en
+una transacción. `--workers` paraleliza la validación sin alterar el orden de
+confirmación. Los puntos de control anteriores se pueden continuar con esta
+versión; los registros de progreso pendientes se absorben al confirmar el
+bloque correspondiente.
+
+Medición local con 400.000 registros generados, cuatro workers y una base de
+datos aislada con los siete índices del esquema: **215,46 s** (3 min 35 s),
+**396.241 filas insertadas**, 3.035 rechazadas, 362 duplicados exactos y 362
+conflictos. La base de prueba ocupó 251 MB. Esto equivale a unas 1.839 filas
+insertadas por segundo. La medición anterior comunicada para 400.000 registros
+fue de **más de cinco minutos**; no fue una ejecución controlada en la misma
+base, por lo que la comparación es orientativa. La base temporal de esta
+medición se eliminó al terminar.
+
 ## Part 1 — Loading the coffee health dataset
 
 ### Schema
@@ -88,9 +107,9 @@ important than filtered reads, I would keep `country`, `age` and
 
 - `app/models.py` — shared `CoffeeRecord` domain model.
 - `app/coffee/constants.py` — CSV header, canonical values, ranges and DB columns.
-- `app/coffee/chunks.py` — line counting, chunk planning and byte offsets.
 - `app/coffee/normalization.py` — pure parsing, normalization and validation.
-- `app/coffee/loader.py` — streaming, staging, COPY and parallel workers.
+- `app/coffee/loader.py` — public loader interface and summary.
+- `app/coffee/stream/` — CSV reader, ordered block orchestration and validation workers.
 - `app/coffee/cli.py` — argparse entrypoint and the load summary printer.
 - `app/coffee/schemas.py` — Pydantic response models and the validated query model.
 - `app/coffee/repository/` — all PostgreSQL access: `reads.py` for filters,
@@ -104,65 +123,26 @@ important than filtered reads, I would keep `country`, `age` and
 
 ### Loader design
 
-`app/coffee/loader.py`, invoked through `app/coffee/cli.py` and
-`scripts/load_data.py`:
+`scripts/load_data.py` invoca `app.coffee.cli` y el importador por bloques:
 
-1. Streams the CSV with `csv.reader`; the file is never loaded into Python memory.
-2. Validates and normalizes each row before it reaches PostgreSQL.
-3. Rejected rows are skipped, printed with their physical line number and
-   reason, and written to `data/rejected_rows.jsonl`.
-4. Valid rows go into a temporary staging table through psycopg's
-   `COPY ... FROM STDIN`.
-5. A single `INSERT ... SELECT DISTINCT ON (id) ... ON CONFLICT (id) DO NOTHING`
-   inserts the first valid occurrence of each ID.
-6. The summary distinguishes loaded, corrected, rejected, exact duplicates, ID
-   conflicts and rows that were already in the table.
+1. `csv.reader` recorre el archivo una vez; solo se mantienen 10.000 registros
+   por bloque en memoria.
+2. La validación se ejecuta con el número de hilos indicado por `--workers`.
+   Los resultados se conservan en el orden original del CSV.
+3. Cada bloque se copia a una tabla temporal con `COPY`. PostgreSQL clasifica
+   duplicados exactos, conflictos, registros ya cargados y filas nuevas con
+   operaciones de conjunto.
+4. Las inserciones, los rechazos y el checkpoint del bloque se confirman en una
+   misma transacción. Una interrupción permite volver a procesar el último
+   bloque incompleto sin duplicar resultados.
+5. Si un bloque provoca un error de datos en PostgreSQL, se divide hasta aislar
+   el registro problemático y reportarlo como rechazado.
 
-The whole load runs in one transaction. The staging table is `UNLOGGED` and is
-dropped at the end of both successful and failed runs, so a crash leaves no
-partial rows in the target table.
-
-### Parallel loading
-
-The same loader can split the file across processes:
-
-1. `app/coffee/chunks.py` counts physical lines and plans contiguous ranges,
-   one per worker. Counting and offset location use binary blocks, so memory
-   stays constant with respect to file size.
-2. The parent creates the shared `UNLOGGED` staging table and takes
-   `pg_advisory_lock(hashtext('coffee_health.load'))`, so two loads cannot
-   overlap.
-3. Each worker (`multiprocessing` **spawn**, never `fork`, to avoid inheriting
-   psycopg connections) seeks to its range, streams and validates it, and
-   `COPY`s valid rows into the shared staging table with their global
-   `source_line`.
-4. The parent merges once with `DISTINCT ON (id) ... ORDER BY id, source_line`,
-   so **first occurrence in the file wins** regardless of worker count or
-   scheduling.
-5. Each worker writes its own reject log; the parent concatenates them in chunk
-   order, keeping the merged JSONL sorted by physical line.
-
-`--workers auto` (default) stays sequential below **50,000** data lines and
-otherwise uses `min(CPU, 8)`. `--workers N` forces a count, including `1`.
-Capping auto mode bounds the number of database connections. A file containing
-an embedded newline inside a quoted field falls back to one worker, because
-splitting by physical line is only safe when quoted records stay on one line.
-Quoted single-line fields do not force a fallback.
-
-The target insert remains a single transaction in the parent. Workers commit
-only their own staging rows; if any worker fails, the parent drops staging, so
-the destination table is never partially loaded.
-
-All of that SQL lives in `app/coffee/repository/imports.py`:
-
-- `import_session` takes the lock and creates the `UNLOGGED` staging table,
-  then drops it and releases the lock on success or failure.
-- `copy_records` streams rows through `COPY`.
-- `create_records` performs the deterministic merge, classifies duplicates and
-  conflicts, inserts the new rows and returns an `ImportReport`.
-
-The loader only parses, validates and orchestrates; it no longer contains SQL
-for the import.
+La primera fila válida para cada ID gana incluso cuando las apariciones caen en
+bloques distintos. `coffee_load_seen` conserva la primera fila normalizada,
+`coffee_load_checkpoint` almacena el avance y `coffee_load_reject` permite
+exportar `errores.csv`. El lector vuelve a recorrer el CSV desde el principio
+al reanudar, pero omite los bloques anteriores al checkpoint.
 
 ### Normalization and rejection rules
 
@@ -263,30 +243,15 @@ Run them with `make test`; the database must be running and the schema applied.
 
 ### Scale notes for the loader
 
-- The CSV is processed as a stream, so file size is not limited by Python memory.
-  The parallel planner also keeps memory constant: it counts in 1 MiB blocks and
-  stores only one offset per worker.
-- `COPY` is the fastest PostgreSQL bulk-ingest path; validation stays in Python
-  as required.
-- The staging table is `UNLOGGED` and lives in the database, so it does not grow
-  Python memory. At tens of millions of rows it will use database disk space;
-  PostgreSQL handles that better than a Python `set` of IDs. Parallel workers
-  write to the same table, and the parent drops it at the end.
-- Automatic parallelism is capped at `min(CPU, 8)` connections. More workers
-  would increase contention on the same staging table and exhaust the server's
-  connection budget.
-- The final `INSERT ... SELECT` is set-based and only touches each unique ID
-  once. `ON CONFLICT (id) DO NOTHING` makes reruns cheap and idempotent. It runs
-  once in the parent, so the destination-table transaction is still atomic.
-- Measured on this machine with the 10,012-row file: sequential `make load`
-  takes ~1.12 s and `make load-parallel` (4 workers) takes ~1.42 s. At this size
-  the process startup dominates, which is why auto mode stays sequential below
-  50,000 lines. The parallel path is designed for files where validation or I/O
-  per row outweighs process startup.
-- One very large transaction is simpler and atomic. If transaction size became
-  a problem, the next step would be batch commits into the target table while
-  keeping the same conflict policy; the trade-off is losing whole-file
-  atomicity and making duplicate reporting more complex.
+- La memoria de Python está acotada por el bloque de 10.000 registros y el
+  número de workers; el tamaño del CSV no se carga completo en memoria.
+- La carga actualiza los siete índices de `coffee_health` y la tabla
+  `coffee_load_seen`. Ambos costes aumentan con los datos almacenados.
+- Cada bloque crea tablas temporales, ejecuta `COPY` y confirma una transacción.
+  El procesamiento por bloques reduce las consultas individuales por fila;
+  el rendimiento real debe medirse en el equipo de destino.
+- La reanudación conserva el estado de la base, pero vuelve a leer el CSV desde
+  el inicio para localizar el primer bloque pendiente.
 
 ## Part 2 — API
 

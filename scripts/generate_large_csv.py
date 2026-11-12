@@ -14,9 +14,21 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "data/coffee_health_raw.csv"
 DEFAULT_OUTPUT = ROOT / "data/coffee_health_15m.csv"
 HEADER = (
-    "ID", "Age", "Gender", "Country", "Coffee_Intake", "Caffeine_mg",
-    "Sleep_Hours", "Sleep_Quality", "BMI", "Heart_Rate", "Stress_Level",
-    "Physical_Activity_Hours", "Health_Issues", "Occupation", "Smoking",
+    "ID",
+    "Age",
+    "Gender",
+    "Country",
+    "Coffee_Intake",
+    "Caffeine_mg",
+    "Sleep_Hours",
+    "Sleep_Quality",
+    "BMI",
+    "Heart_Rate",
+    "Stress_Level",
+    "Physical_Activity_Hours",
+    "Health_Issues",
+    "Occupation",
+    "Smoking",
     "Alcohol_Consumption",
 )
 

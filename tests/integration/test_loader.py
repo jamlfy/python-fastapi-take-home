@@ -4,8 +4,10 @@ import csv
 import shutil
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import psycopg
+import pytest
 
 from app.coffee.loader import load
 from app.config import settings
@@ -23,7 +25,8 @@ def _delete_fixture_rows() -> None:
         )
 
 
-def test_loader_is_idempotent_and_resolves_conflicts(tmp_path: Path) -> None:
+def test_loader_is_idempotent_and_resolves_conflicts(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setattr("app.coffee.stream.BLOCK_SIZE", 1)
     reject_log = tmp_path / "errores.csv"
     source = tmp_path / "source.csv"
     shutil.copyfile(FIXTURE, source)
@@ -92,7 +95,8 @@ def test_loader_is_idempotent_and_resolves_conflicts(tmp_path: Path) -> None:
         _delete_fixture_rows()
 
 
-def test_parallel_loader_matches_the_sequential_result(tmp_path: Path) -> None:
+def test_parallel_loader_matches_the_sequential_result(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setattr("app.coffee.stream.BLOCK_SIZE", 3)
     sequential_log = tmp_path / "sequential.csv"
     parallel_log = tmp_path / "parallel.csv"
     sequential_source = tmp_path / "sequential-source.csv"
@@ -132,5 +136,70 @@ def test_parallel_loader_matches_the_sequential_result(tmp_path: Path) -> None:
         assert again.already_loaded == parallel.already_loaded
         assert again.rejected == parallel.rejected
         assert again.accounted_for == again.rows_read
+    finally:
+        _delete_fixture_rows()
+
+
+def test_resume_after_committed_block(tmp_path: Path, monkeypatch: Any) -> None:
+    from app.coffee.repository.imports import CoffeeBlockWriter
+
+    monkeypatch.setattr("app.coffee.stream.BLOCK_SIZE", 2)
+    source = tmp_path / "interrupted.csv"
+    reject_log = tmp_path / "errors.csv"
+    shutil.copyfile(FIXTURE, source)
+    _delete_fixture_rows()
+    original = CoffeeBlockWriter.save_block
+    calls = 0
+
+    def interrupt_after_first(self: CoffeeBlockWriter, rows: Any) -> None:
+        nonlocal calls
+        if calls == 1:
+            raise RuntimeError("simulated interruption")
+        original(self, rows)
+        calls += 1
+
+    try:
+        monkeypatch.setattr(CoffeeBlockWriter, "save_block", interrupt_after_first)
+        with pytest.raises(RuntimeError, match="simulated interruption"):
+            load(source, reject_log, workers=2)
+        monkeypatch.setattr(CoffeeBlockWriter, "save_block", original)
+        resumed = load(source, reject_log, workers=2)
+        assert resumed.rows_read == 16
+        assert resumed.loaded == 6
+        assert resumed.rejected == 8
+        assert resumed.exact_duplicates == 1
+        assert resumed.conflicts == 1
+        assert resumed.accounted_for == resumed.rows_read
+    finally:
+        _delete_fixture_rows()
+
+
+def test_resume_from_legacy_progress(tmp_path: Path, monkeypatch: Any) -> None:
+    from app.coffee.repository.imports import CoffeeBatchWriter, ImportCheckpoint
+    from app.coffee.stream.reader import read_records
+    from app.coffee.stream.workers import validate_record
+
+    monkeypatch.setattr("app.coffee.stream.BLOCK_SIZE", 2)
+    source = tmp_path / "legacy.csv"
+    reject_log = tmp_path / "errors.csv"
+    shutil.copyfile(FIXTURE, source)
+    _delete_fixture_rows()
+    stat = source.stat()
+    checkpoint = ImportCheckpoint(str(source.resolve()), f"{stat.st_size}:{stat.st_mtime_ns}")
+    writer = CoffeeBatchWriter(str(source.resolve()))
+    try:
+        first_two = list(read_records(source))[:2]
+        writer.save_batch([(seq, validate_record(row)) for seq, row in first_two])
+    finally:
+        writer.close()
+        checkpoint.close()
+
+    try:
+        summary = load(source, reject_log, workers=2)
+        assert summary.rows_read == 16
+        assert summary.loaded == 6
+        assert summary.exact_duplicates == 1
+        assert summary.rejected == 8
+        assert summary.accounted_for == summary.rows_read
     finally:
         _delete_fixture_rows()
