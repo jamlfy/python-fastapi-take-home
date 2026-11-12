@@ -1,4 +1,4 @@
-.PHONY: setup db-up db-down db-reset db-shell dev load load-parallel test test-unit test-integration lint hooks
+.PHONY: setup db-up db-down db-reset db-shell dev load load-parallel generate-large-csv test test-unit test-integration coverage lint hooks
 
 setup:          ## Install dependencies, create .env and install git hooks
 	uv sync
@@ -27,6 +27,12 @@ load:           ## Run the data loader (auto: sequential below 50k lines)
 load-parallel:  ## Run the loader splitting the file across 4 worker processes
 	uv run python scripts/load_data.py data/coffee_health_raw.csv --workers 4
 
+load-large:    ## Run the data large loader
+	uv run python scripts/load_data.py data/coffee_health_15m.csv
+
+large-example: ## Generate 15 million coffee records (COUNT and OUTPUT can be overridden)
+	uv run python scripts/generate_large_csv.py --count $(or $(COUNT),15000000) --output $(or $(OUTPUT),data/coffee_health_15m.csv)
+
 test:           ## Run the full test suite (needs the database running)
 	uv run pytest
 
@@ -35,6 +41,9 @@ test-unit:      ## Run tests that do not need the database
 
 test-integration: ## Run tests that use the real database
 	uv run pytest tests/integration
+
+coverage:       ## Run all tests with terminal and HTML coverage reports (needs database)
+	uv run pytest --cov=app --cov=scripts --cov-report=term-missing --cov-report=html
 
 lint:           ## Lint, check formatting and type-check
 	uv run ruff check .

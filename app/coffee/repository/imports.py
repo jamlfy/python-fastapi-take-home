@@ -1,204 +1,280 @@
-"""Write-side PostgreSQL access for the coffee health CSV import."""
+"""Transactional storage for the one-pass coffee import."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Final
+import csv
+import json
+from collections import Counter
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-from psycopg import Connection, Error
-from psycopg.rows import DictRow
+import psycopg
+from psycopg import Connection, sql
+from psycopg.rows import DictRow, dict_row
 
 from app.coffee.constants import COLUMNS
+from app.config import settings
 
-STAGING_TABLE: Final = "coffee_health_staging"
-COPY_SQL: Final = (
-    f"copy {STAGING_TABLE} (source_line, needs_fix, " + ", ".join(COLUMNS) + ") from stdin"
-)
-DROP_STAGING_SQL: Final = f"drop table if exists {STAGING_TABLE}"
-CREATE_STAGING_SQL: Final = f"""
-create unlogged table {STAGING_TABLE} (
-  source_line integer not null,
-  needs_fix boolean not null,
-  id integer not null,
-  age smallint not null,
-  gender text not null,
-  country text not null,
-  coffee_intake numeric(4, 1) not null,
-  caffeine_mg numeric(6, 1) not null,
-  sleep_hours numeric(3, 1) not null,
-  sleep_quality text not null,
-  bmi numeric(4, 1) not null,
-  heart_rate smallint not null,
-  stress_level text not null,
-  physical_activity_hours numeric(4, 1) not null,
-  health_issues text not null,
-  occupation text not null,
-  smoking boolean not null,
-  alcohol_consumption boolean not null
-)
-"""
-ADVISORY_LOCK_SQL: Final = "select pg_advisory_lock(hashtext('coffee_health.load'))"
-ADVISORY_UNLOCK_SQL: Final = "select pg_advisory_unlock(hashtext('coffee_health.load'))"
-INSERT_SQL: Final = f"""
-with chosen as (
-  select distinct on (id) {", ".join(COLUMNS)}
-  from {STAGING_TABLE}
-  order by id, source_line
-),
-inserted as (
-  insert into coffee_health ({", ".join(COLUMNS)})
-  select {", ".join(COLUMNS)}
-  from chosen
-  on conflict (id) do nothing
-  returning 1
-)
-select count(*) as loaded
-from inserted
-"""
+if TYPE_CHECKING:
+    from app.coffee.stream.workers import ValidatedRecord
 
 
-@dataclass(frozen=True, slots=True)
-class ImportReport:
-    """Database-side counts for one finished import."""
+class ImportCheckpoint:
+    """The manager's durable checkpoint and reject log."""
 
-    staged_rows: int
-    distinct_ids: int
-    exact_duplicates: int
-    conflicts: int
-    already_loaded: int
-    corrected: int
-    loaded: int
-
-
-@dataclass(frozen=True, slots=True)
-class _ImportCounts:
-    staged_rows: int
-    distinct_ids: int
-    exact_duplicates: int
-    conflicts: int
-    already_loaded: int
-    corrected: int
-
-
-@contextmanager
-def import_session(conn: Connection[DictRow]) -> Iterator[None]:
-    """Own the import transaction: lock, staging setup, cleanup and unlock."""
-    conn.execute(ADVISORY_LOCK_SQL)
-    conn.execute(DROP_STAGING_SQL)
-    conn.execute(CREATE_STAGING_SQL)
-    conn.commit()
-
-    try:
-        yield
-    finally:
-        try:
-            conn.rollback()
-            conn.execute(DROP_STAGING_SQL)
-            conn.commit()
-        except Error:
-            conn.rollback()
-
-        try:
-            conn.execute(ADVISORY_UNLOCK_SQL)
-            conn.commit()
-        except Error:
-            conn.rollback()
-
-
-def copy_records(conn: Connection[DictRow], rows: Iterable[tuple[object, ...]]) -> None:
-    """Stream already-normalized rows into the shared staging table."""
-    with conn.cursor() as cursor, cursor.copy(COPY_SQL) as copy:
-        for row in rows:
-            copy.write_row(row)
-
-
-def _import_counts(conn: Connection[DictRow]) -> _ImportCounts:
-    """Return every database-side count for the current staging contents."""
-    row = conn.execute(
-        f"""
-        with duplicate_ids as (
-          select
-            id,
-            count(*) as row_count,
-            count(distinct (
-              age, gender, country, coffee_intake, caffeine_mg, sleep_hours,
-              sleep_quality, bmi, heart_rate, stress_level,
-              physical_activity_hours, health_issues, occupation, smoking,
-              alcohol_consumption
-            )) as distinct_rows
-          from {STAGING_TABLE}
-          group by id
-          having count(*) > 1
-        ),
-        chosen as (
-          select distinct on (id) id, needs_fix
-          from {STAGING_TABLE}
-          order by id, source_line
+    def __init__(self, source: str, signature: str) -> None:
+        self.source = source
+        self.conn: Connection[DictRow] = psycopg.connect(
+            settings.database_url, row_factory=dict_row, autocommit=True
         )
-        select
-          (select count(*) from {STAGING_TABLE}) as staged_rows,
-          (select count(distinct id) from {STAGING_TABLE}) as distinct_ids,
-          coalesce(
-            (select sum(row_count - distinct_rows) from duplicate_ids),
-            0
-          ) as exact_duplicates,
-          coalesce(
-            (select sum(distinct_rows - 1) from duplicate_ids),
-            0
-          ) as conflicts,
-          (
-            select count(*)
-            from (select distinct id from {STAGING_TABLE}) staged_ids
-            where exists (
-              select 1 from coffee_health target where target.id = staged_ids.id
+        self.conn.execute("select pg_advisory_lock(hashtext(%s))", (source,))
+        self.conn.execute("""create table if not exists coffee_load_checkpoint (
+            source text primary key, signature text not null, seq bigint not null,
+            line integer not null, completed boolean not null default false,
+            counts jsonb not null default '{}'::jsonb,
+            reasons jsonb not null default '{}'::jsonb)""")
+        self.conn.execute(
+            "alter table coffee_load_checkpoint add column if not exists seq "
+            "bigint not null default 0"
+        )
+        self.conn.execute("""create table if not exists coffee_load_progress (
+            source text not null, seq bigint not null, line integer not null,
+            kind text not null, corrected boolean not null default false,
+            reason text, primary key (source,seq))""")
+        self.conn.execute("""create table if not exists coffee_load_reject (
+            source text not null, line integer not null, reason text not null,
+            raw text not null, primary key (source,line))""")
+        self.conn.execute("""create table if not exists coffee_load_seen (
+            source text not null, id integer not null, first_row jsonb not null,
+            primary key (source,id))""")
+        state = self.conn.execute(
+            "select * from coffee_load_checkpoint where source=%s", (source,)
+        ).fetchone()
+        if state and not state["completed"] and state["signature"] != signature:
+            from app.coffee.loader import LoaderError
+
+            raise LoaderError("CSV changed since the checkpoint")
+        if not state or state["signature"] != signature:
+            with self.conn.transaction():
+                for table in ("coffee_load_progress", "coffee_load_reject", "coffee_load_seen"):
+                    self.conn.execute(
+                        sql.SQL("delete from {} where source=%s").format(sql.Identifier(table)),
+                        (source,),
+                    )
+                self.conn.execute(
+                    "insert into coffee_load_checkpoint "
+                    "(source,signature,seq,line,completed,counts,reasons) "
+                    "values (%s,%s,0,0,false,'{}','{}') on conflict(source) do update set "
+                    "signature=excluded.signature,seq=0,line=0,completed=false,"
+                    "counts='{}',reasons='{}'",
+                    (source, signature),
+                )
+            self.seq = 0
+            self.line = 0
+            self.counts: Counter[str] = Counter()
+            self.reasons: Counter[str] = Counter()
+            self.completed = False
+        else:
+            self.seq = state["seq"]
+            self.line = state["line"]
+            self.counts = Counter(state["counts"])
+            self.reasons = Counter(state["reasons"])
+            self.completed = state["completed"]
+
+    def is_record_confirmed(self, seq: int) -> bool:
+        if seq <= self.seq:
+            return True
+        return (
+            self.conn.execute(
+                "select 1 from coffee_load_progress where source=%s and seq=%s",
+                (self.source, seq),
+            ).fetchone()
+            is not None
+        )
+
+    def advance_through_confirmed_records(self) -> None:
+        """Move only through a consecutive sequence of committed records."""
+        with self.conn.transaction():
+            while row := self.conn.execute(
+                "select seq,line,kind,corrected,reason from coffee_load_progress "
+                "where source=%s and seq=%s",
+                (self.source, self.seq + 1),
+            ).fetchone():
+                self.seq = row["seq"]
+                self.line = row["line"]
+                kind = row["kind"]
+                self.counts[kind] += 1
+                if kind != "blank_lines":
+                    self.counts["rows_read"] += 1
+                if row["corrected"]:
+                    self.counts["corrected"] += 1
+                if row["reason"]:
+                    self.reasons[row["reason"].split(":", 1)[0]] += 1
+                self.conn.execute(
+                    "delete from coffee_load_progress where source=%s and seq=%s",
+                    (self.source, self.seq),
+                )
+            self.conn.execute(
+                "update coffee_load_checkpoint set seq=%s,line=%s,counts=%s,reasons=%s "
+                "where source=%s",
+                (
+                    self.seq,
+                    self.line,
+                    json.dumps(self.counts),
+                    json.dumps(self.reasons),
+                    self.source,
+                ),
             )
-          ) as already_loaded,
-          (
-            select count(*)
-            from chosen
-            where chosen.needs_fix
-              and not exists (
-                select 1 from coffee_health target where target.id = chosen.id
-              )
-          ) as corrected
-        """
-    ).fetchone()
-    if row is None:
-        raise RuntimeError("database returned no import counts")
 
-    return _ImportCounts(
-        staged_rows=int(row["staged_rows"]),
-        distinct_ids=int(row["distinct_ids"]),
-        exact_duplicates=int(row["exact_duplicates"]),
-        conflicts=int(row["conflicts"]),
-        already_loaded=int(row["already_loaded"]),
-        corrected=int(row["corrected"]),
-    )
+    def mark_complete(self, expected_seq: int) -> None:
+        self.advance_through_confirmed_records()
+        if self.seq != expected_seq:
+            from app.coffee.loader import LoaderError
+
+            raise LoaderError(
+                f"cannot complete import: confirmed {self.seq} of {expected_seq} records"
+            )
+        self.conn.execute(
+            "update coffee_load_checkpoint set completed=true where source=%s",
+            (self.source,),
+        )
+
+    def write_errors_csv(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self.conn.transaction(), path.open("w", encoding="utf-8", newline="") as output:
+            writer = csv.writer(output)
+            writer.writerow(("line", "reason", "raw"))
+            with self.conn.cursor(name="coffee_reject_export") as cursor:
+                cursor.execute(
+                    "select line,reason,raw from coffee_load_reject where source=%s order by line",
+                    (self.source,),
+                )
+                for row in cursor:
+                    writer.writerow((row["line"], row["reason"], row["raw"]))
+
+    def close(self) -> None:
+        self.conn.close()
 
 
-def create_records(conn: Connection[DictRow]) -> ImportReport:
-    """Merge staging and insert the first occurrence of every ID.
+class CoffeeBatchWriter:
+    """One worker's connection; a whole batch commits or rolls back."""
 
-    This is the record-creator used by the CSV import: it classifies duplicates
-    and conflicts, inserts new IDs with ``ON CONFLICT DO NOTHING`` and drops the
-    staging table. The whole step is atomic.
-    """
-    counts = _import_counts(conn)
-    row = conn.execute(INSERT_SQL).fetchone()
-    if row is None:
-        raise RuntimeError("database returned no result for the insert")
+    def __init__(self, source: str) -> None:
+        self.source = source
+        self.conn: Connection[DictRow] = psycopg.connect(
+            settings.database_url, row_factory=dict_row, autocommit=True
+        )
+        columns = sql.SQL(", ").join(map(sql.Identifier, COLUMNS))
+        self.single_insert = sql.SQL(
+            "insert into coffee_health ({}) values ({}) on conflict (id) do nothing returning id"
+        ).format(columns, sql.SQL(", ").join(sql.Placeholder() for _ in COLUMNS))
+        self.columns = columns
 
-    conn.execute(DROP_STAGING_SQL)
-    conn.commit()
+    def _progress(
+        self,
+        seq: int,
+        row: ValidatedRecord,
+        kind: str,
+        corrected: bool = False,
+        reason: str | None = None,
+    ) -> None:
+        self.conn.execute(
+            "insert into coffee_load_progress(source,seq,line,kind,corrected,reason) "
+            "values (%s,%s,%s,%s,%s,%s) on conflict do nothing",
+            (self.source, seq, row[0], kind, corrected, reason),
+        )
+        if kind == "rejected":
+            self.conn.execute(
+                "insert into coffee_load_reject(source,line,reason,raw) "
+                "values (%s,%s,%s,%s) on conflict(source,line) do update set "
+                "reason=excluded.reason,raw=excluded.raw",
+                (self.source, row[0], reason, row[2]),
+            )
 
-    return ImportReport(
-        staged_rows=counts.staged_rows,
-        distinct_ids=counts.distinct_ids,
-        exact_duplicates=counts.exact_duplicates,
-        conflicts=counts.conflicts,
-        already_loaded=counts.already_loaded,
-        corrected=counts.corrected,
-        loaded=int(row["loaded"]),
-    )
+    def save_batch(self, rows: list[tuple[int, ValidatedRecord]]) -> None:
+        """Try a bulk insert, then retry every row after a data error."""
+        try:
+            with self.conn.transaction():
+                self._save_rows(rows, bulk=True)
+        except (psycopg.DataError, psycopg.IntegrityError):
+            with self.conn.transaction():
+                self._save_rows(rows, bulk=False)
+
+    def _save_rows(self, rows: list[tuple[int, ValidatedRecord]], *, bulk: bool) -> None:
+        from app.coffee.loader import to_db_row
+
+        candidates: list[tuple[int, ValidatedRecord, tuple[object, ...], bool]] = []
+        for seq, row in rows:
+            if not row[1]:
+                self._progress(seq, row, "blank_lines")
+                continue
+            normalized, error = row[3], row[4]
+            if error or normalized is None:
+                self._progress(seq, row, "rejected", reason=error or "invalid record")
+                continue
+            record, fixes = normalized
+            values = to_db_row(record)
+            first_row = [str(value) for value in values]
+            canonical = json.dumps(first_row)
+            prior = self.conn.execute(
+                "insert into coffee_load_seen(source,id,first_row) "
+                "values (%s,%s,%s) on conflict do nothing returning id",
+                (self.source, record.id, canonical),
+            ).fetchone()
+            if prior is None:
+                previous = self.conn.execute(
+                    "select first_row from coffee_load_seen where source=%s and id=%s",
+                    (self.source, record.id),
+                ).fetchone()
+                kind = (
+                    "exact_duplicates"
+                    if previous and previous["first_row"] == first_row
+                    else "conflicts"
+                )
+                self._progress(seq, row, kind)
+                continue
+            if bulk:
+                candidates.append((seq, row, values, fixes))
+                continue
+            try:
+                with self.conn.transaction():
+                    inserted = self.conn.execute(self.single_insert, values).fetchone()
+            except (psycopg.DataError, psycopg.IntegrityError) as exc:
+                self.conn.execute(
+                    "delete from coffee_load_seen where source=%s and id=%s",
+                    (self.source, record.id),
+                )
+                self._progress(seq, row, "rejected", reason=str(exc).strip())
+                continue
+            self._progress(
+                seq,
+                row,
+                "loaded" if inserted else "already_loaded",
+                corrected=bool(fixes and inserted),
+            )
+        if not candidates:
+            return
+        statement = sql.SQL(
+            "insert into coffee_health ({}) values {} on conflict (id) do nothing returning id"
+        ).format(
+            self.columns,
+            sql.SQL(", ").join(
+                sql.SQL("({})").format(sql.SQL(", ").join(sql.Placeholder() for _ in COLUMNS))
+                for _ in candidates
+            ),
+        )
+        bulk_inserted = self.conn.execute(
+            statement, [value for _, _, values, _ in candidates for value in values]
+        ).fetchall()
+        ids = {result["id"] for result in bulk_inserted}
+        for seq, row, values, fixes in candidates:
+            loaded = values[0] in ids
+            self._progress(
+                seq,
+                row,
+                "loaded" if loaded else "already_loaded",
+                corrected=bool(fixes and loaded),
+            )
+
+    def close(self) -> None:
+        self.conn.close()

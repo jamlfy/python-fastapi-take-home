@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 
 from app.coffee.constants import EXPECTED_HEADER
-from app.coffee.loader import iter_rows
 from app.coffee.normalization import (
     RowError,
     normalize_row,
@@ -179,7 +178,14 @@ def test_dirty_fixture_contains_expected_valid_and_invalid_rows() -> None:
     accepted: list[int] = []
     rejected: list[tuple[int, str]] = []
 
-    for line_number, fields in iter_rows(FIXTURE):
+    import csv
+
+    with FIXTURE.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.reader(handle)
+        next(reader)
+        rows = [(reader.line_num, tuple(fields)) for fields in reader]
+
+    for line_number, fields in rows:
         if not fields:
             continue
         try:

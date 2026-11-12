@@ -1,5 +1,45 @@
 # Notes
 
+## Prueba con 15 millones de registros
+
+Desde la raíz del proyecto:
+
+```bash
+make setup
+make db-up
+make large-example
+wc -l data/coffee_health_15m.csv
+time make load-large
+```
+
+`make large-example` genera 15 millones de registros de datos más la cabecera
+(15.000.001 líneas físicas). El generador escribe el CSV de forma secuencial y
+añade casos corregibles, inválidos y duplicados; usa una semilla fija para que
+el resultado sea reproducible. El archivo ocupa aproximadamente 1,2 GB, así
+que hace falta espacio adicional para las tablas, índices y registros de
+PostgreSQL. Si el CSV ya existe, se puede omitir la generación.
+
+`make load-large` carga el archivo en PostgreSQL y muestra el resumen de filas
+leídas, cargadas, corregidas, rechazadas y duplicadas. Los rechazos se exportan
+a `errores.csv`. Para comprobar el resultado en la base de datos:
+
+```bash
+make db-shell
+```
+
+Dentro de `psql`:
+
+```sql
+SELECT count(*) FROM coffee_health;
+```
+
+El conteo en la tabla puede ser menor que 15 millones por los registros
+rechazados, duplicados o ya cargados. La carga guarda puntos de control: si se
+interrumpe, se puede ejecutar `make load-large` otra vez con el mismo CSV para
+reanudarla. No regenerar ni modificar el archivo antes de reanudar, porque la
+firma del archivo debe coincidir con la del punto de control. Para una prueba
+rápida, usar `make large-example COUNT=10000` y luego `make load-large`.
+
 ## Part 1 — Loading the coffee health dataset
 
 ### Schema
@@ -199,53 +239,6 @@ Accounted for:      10012
 The 56 corrected rows break down as: 18 countries, 13 sleep-quality values,
 10 stress-level values, 5 genders, 4 occupations, 3 smoking values and 3
 alcohol values (one correction per row).
-
-### Rejected rows (25)
-
-Physical CSV line numbers, header = line 1. Raw row data is in
-`data/rejected_rows.jsonl`.
-
-| Line | Reason |
-|---:|---|
-| 107 | `Sleep_Hours` −1, outside 0–16 |
-| 816 | `Age` is `thirty` |
-| 1114 | `Age` 212, outside 18–100 |
-| 1154 | `Age` is empty |
-| 1809 | `Sleep_Hours` is empty |
-| 1918 | `Age` is `4O` |
-| 2128 | `Age` 150, outside 18–100 |
-| 2659 | 17 columns instead of 16 |
-| 3187 | `Sleep_Hours` 25, outside 0–16 |
-| 3240 | `Age` is `unknown` |
-| 3388 | `Smoking` is `-1` |
-| 3517 | `Gender` is empty |
-| 4128 | `Gender` is `?` |
-| 4380 | `Gender` is `N/A` |
-| 4869 | 13 columns instead of 16 |
-| 4880 | `BMI` is empty |
-| 5894 | `Heart_Rate` 0, outside 30–220 |
-| 6606 | `Age` −3, outside 18–100 |
-| 6803 | `BMI` 0, outside 10–60 |
-| 6988 | `Heart_Rate` is empty |
-| 7089 | `Sleep_Hours` is `seven` |
-| 7175 | 13 columns instead of 16 |
-| 7902 | `BMI` is `n/a` |
-| 8226 | `Smoking` is `2` |
-| 9872 | `Heart_Rate` 350, outside 30–220 |
-
-### Duplicate rows (12)
-
-Exact duplicates skipped (8): lines 6309, 6939, 7650, 8087, 8480, 9362, 9373,
-9990.
-
-Conflicting IDs skipped because the first occurrence won (4):
-
-| ID | Skipped line | Difference |
-|---|---:|---|
-| 3338 | 3516 | `Age` 33 vs 26, `Heart_Rate` 80 vs 86 |
-| 6115 | 7240 | `Age` 32 vs 25, `Heart_Rate` 71 vs 67 |
-| 6748 | 9278 | `Age` 41 vs 46, `Heart_Rate` 77 vs 83 |
-| 7494 | 9737 | `Age` 35 vs 28, `Heart_Rate` 71 vs 77 |
 
 ### Tests
 

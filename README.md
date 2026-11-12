@@ -84,6 +84,7 @@ SQL files in `db/init/` run in filename order **only when the database volume is
 | `make dev` | `uv run fastapi dev app/main.py` | Run the API with auto-reload on port 8000 |
 | `make load` | `uv run python scripts/load_data.py data/coffee_health_raw.csv` | Run the data loader |
 | `make test` | `uv run pytest` | Run tests (the database must be running) |
+| `make coverage` | `uv run pytest --cov=app --cov=scripts` | Run tests with terminal and `htmlcov/index.html` coverage reports (database required) |
 | `make lint` | `ruff check`, `ruff format --check`, `mypy` | Lint, check formatting and type-check |
 
 ### Project layout
@@ -270,6 +271,7 @@ Los archivos SQL de `db/init/` se ejecutan en orden de nombre **solo cuando se c
 | `make dev` | `uv run fastapi dev app/main.py` | Ejecutar la API con recarga automática en el puerto 8000 |
 | `make load` | `uv run python scripts/load_data.py data/coffee_health_raw.csv` | Ejecutar el script de carga |
 | `make test` | `uv run pytest` | Ejecutar las pruebas (la base de datos debe estar en ejecución) |
+| `make coverage` | `uv run pytest --cov=app --cov=scripts` | Ejecutar pruebas con cobertura en terminal y `htmlcov/index.html` (requiere la base de datos) |
 | `make lint` | `ruff check`, `ruff format --check`, `mypy` | Lint, formato y verificación de tipos |
 
 ### Estructura del proyecto

@@ -7,7 +7,6 @@ from pathlib import Path
 
 import psycopg
 
-from app.coffee.chunks import ChunkError
 from app.coffee.loader import LoaderError, LoadSummary, load
 
 
@@ -52,22 +51,19 @@ def main() -> None:
     parser.add_argument(
         "--reject-log",
         type=Path,
-        default=Path("data/rejected_rows.jsonl"),
-        help="Where to write rejected rows as JSON Lines (default: data/rejected_rows.jsonl)",
+        default=Path("errores.csv"),
+        help="Where to write rejected rows as CSV (default: errores.csv)",
     )
     parser.add_argument(
         "--workers",
         type=_parse_workers,
         default=None,
         metavar="auto|N",
-        help=(
-            "Worker processes. 'auto' (default) stays sequential below 50,000 "
-            "lines and then uses min(CPU, 8); N forces N workers."
-        ),
+        help=("Worker threads. 'auto' (default) uses min(CPU, 8); N selects a fixed worker count."),
     )
     args = parser.parse_args()
     try:
         summary = load(args.csv_path, args.reject_log, workers=args.workers)
-    except (LoaderError, ChunkError, psycopg.Error) as exc:
+    except (LoaderError, psycopg.Error) as exc:
         raise SystemExit(f"load failed: {exc}") from exc
     print_summary(summary, args.reject_log)

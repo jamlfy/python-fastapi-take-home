@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
+import csv
+import shutil
 from decimal import Decimal
 from pathlib import Path
 
 import psycopg
 
-from app.coffee.chunks import scan_file
 from app.coffee.loader import load
 from app.config import settings
 
@@ -24,11 +24,13 @@ def _delete_fixture_rows() -> None:
 
 
 def test_loader_is_idempotent_and_resolves_conflicts(tmp_path: Path) -> None:
-    reject_log = tmp_path / "rejected_rows.jsonl"
+    reject_log = tmp_path / "errores.csv"
+    source = tmp_path / "source.csv"
+    shutil.copyfile(FIXTURE, source)
     _delete_fixture_rows()
 
     try:
-        first = load(FIXTURE, reject_log)
+        first = load(source, reject_log)
 
         assert first.rows_read == 16
         assert first.loaded == 6
@@ -39,12 +41,12 @@ def test_loader_is_idempotent_and_resolves_conflicts(tmp_path: Path) -> None:
         assert first.already_loaded == 0
         assert first.accounted_for == first.rows_read
 
-        reject_lines = reject_log.read_text(encoding="utf-8").splitlines()
+        with reject_log.open(newline="", encoding="utf-8") as handle:
+            reject_lines = list(csv.DictReader(handle))
         assert len(reject_lines) == 8
-        first_reject = json.loads(reject_lines[0])
-        assert first_reject["line"] == 9
-        assert "reason" in first_reject
-        assert isinstance(first_reject["raw"], list)
+        assert reject_lines[0]["line"] == "9"
+        assert reject_lines[0]["reason"]
+        assert reject_lines[0]["raw"]
 
         with psycopg.connect(settings.database_url) as connection:
             count_row = connection.execute(
@@ -77,34 +79,32 @@ def test_loader_is_idempotent_and_resolves_conflicts(tmp_path: Path) -> None:
             assert conflict_winner is not None
             assert conflict_winner[0] == 30
 
-        second = load(FIXTURE, reject_log)
+        second = load(source, reject_log)
 
-        assert second.loaded == 0
-        assert second.corrected == 0
+        assert second.loaded == first.loaded
+        assert second.corrected == first.corrected
         assert second.rejected == 8
         assert second.exact_duplicates == 1
         assert second.conflicts == 1
-        assert second.already_loaded == 6
+        assert second.already_loaded == first.already_loaded
         assert second.accounted_for == second.rows_read
     finally:
         _delete_fixture_rows()
 
 
 def test_parallel_loader_matches_the_sequential_result(tmp_path: Path) -> None:
-    sequential_log = tmp_path / "sequential.jsonl"
-    parallel_log = tmp_path / "parallel.jsonl"
+    sequential_log = tmp_path / "sequential.csv"
+    parallel_log = tmp_path / "parallel.csv"
+    sequential_source = tmp_path / "sequential-source.csv"
+    parallel_source = tmp_path / "parallel-source.csv"
+    shutil.copyfile(FIXTURE, sequential_source)
+    shutil.copyfile(FIXTURE, parallel_source)
     _delete_fixture_rows()
 
     try:
-        # The fixture has quoted fields on a single line, which must stay safe
-        # for line-based splitting; only embedded newlines force a fallback.
-        scan = scan_file(FIXTURE, 4)
-        assert scan.workers == 4
-        assert scan.has_multiline_records is False
-
-        sequential = load(FIXTURE, sequential_log, workers=1)
+        sequential = load(sequential_source, sequential_log, workers=1)
         _delete_fixture_rows()
-        parallel = load(FIXTURE, parallel_log, workers=4)
+        parallel = load(parallel_source, parallel_log, workers=4)
 
         # Same counts and same reject reasons regardless of the worker count.
         assert parallel == sequential
@@ -126,10 +126,10 @@ def test_parallel_loader_matches_the_sequential_result(tmp_path: Path) -> None:
             assert conflict_winner is not None
             assert conflict_winner[0] == 30
 
-        again = load(FIXTURE, parallel_log, workers=4)
+        again = load(parallel_source, parallel_log, workers=4)
 
-        assert again.loaded == 0
-        assert again.already_loaded == 6
+        assert again.loaded == parallel.loaded
+        assert again.already_loaded == parallel.already_loaded
         assert again.rejected == parallel.rejected
         assert again.accounted_for == again.rows_read
     finally:

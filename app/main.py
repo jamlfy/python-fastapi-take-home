@@ -40,4 +40,5 @@ def list_notes(conn: DbConn) -> list[Note]:
     rows = conn.execute("select id, title from notes order by id").fetchall()
     return [Note.model_validate(row) for row in rows]
 
+
 app.include_router(coffee_router)

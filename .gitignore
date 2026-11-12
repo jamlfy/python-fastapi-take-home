@@ -5,6 +5,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 *.egg-info/
 
 # Environment
@@ -19,3 +21,4 @@ data/rejected_rows.jsonl
 .DS_Store
 .idea/
 .vscode/
+data/coffee_health_15m.csv
