@@ -23,10 +23,21 @@ class Health(BaseModel):
     database: str
 
 
+class Note(BaseModel):
+    id: int
+    title: str
+
+
 @app.get("/health")
 def health(conn: DbConn) -> Health:
     conn.execute("select 1")
     return Health(status="ok", database="ok")
 
+
+@app.get("/notes")
+def list_notes(conn: DbConn) -> list[Note]:
+    """Example endpoint backed by the sample `notes` table. Keep, replace or remove it."""
+    rows = conn.execute("select id, title from notes order by id").fetchall()
+    return [Note.model_validate(row) for row in rows]
 
 app.include_router(coffee_router)
