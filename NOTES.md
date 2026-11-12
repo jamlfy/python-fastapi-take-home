@@ -1,8 +1,8 @@
 # Notes
 
-## Prueba con 15 millones de registros
+## Testing with 15 million records
 
-Desde la raíz del proyecto:
+From the project root:
 
 ```bash
 make setup
@@ -12,52 +12,44 @@ wc -l data/coffee_health_15m.csv
 time make load-large
 ```
 
-`make large-example` genera 15 millones de registros de datos más la cabecera
-(15.000.001 líneas físicas). El generador escribe el CSV de forma secuencial y
-añade casos corregibles, inválidos y duplicados; usa una semilla fija para que
-el resultado sea reproducible. El archivo ocupa aproximadamente 1,2 GB, así
-que hace falta espacio adicional para las tablas, índices y registros de
-PostgreSQL. Si el CSV ya existe, se puede omitir la generación.
+`make large-example` generates 15 million data records plus the header
+(15,000,001 physical lines). The generator writes the CSV sequentially and
+adds correctable values, invalid rows, and duplicates. A fixed random seed
+makes the output reproducible. The file is about 1.2 GB; PostgreSQL also needs
+space for its tables, indexes, and write-ahead log. Skip generation if the
+file already exists.
 
-`make load-large` carga el archivo en PostgreSQL y muestra el resumen de filas
-leídas, cargadas, corregidas, rechazadas y duplicadas. Los rechazos se exportan
-a `errores.csv`. Para comprobar el resultado en la base de datos:
-
-```bash
-make db-shell
-```
-
-Dentro de `psql`:
+`make load-large` prints counts of read, loaded, corrected, rejected, and
+duplicate records. Rejections are exported to `errores.csv`. To inspect the
+database, run `make db-shell`, then:
 
 ```sql
 SELECT count(*) FROM coffee_health;
 ```
 
-El conteo en la tabla puede ser menor que 15 millones por los registros
-rechazados, duplicados o ya cargados. La carga guarda puntos de control: si se
-interrumpe, se puede ejecutar `make load-large` otra vez con el mismo CSV para
-reanudarla. No regenerar ni modificar el archivo antes de reanudar, porque la
-firma del archivo debe coincidir con la del punto de control. Para una prueba
-rápida, usar `make large-example COUNT=10000` y luego `make load-large`.
+The table can contain fewer than 15 million rows because of rejections,
+duplicates, and IDs loaded earlier. After an interruption, rerun
+`make load-large` with the same CSV to resume from its checkpoint. Do not
+regenerate or edit the CSV before resuming: its file signature must match the
+checkpoint. For a small trial, run `make large-example COUNT=10000` followed
+by `make load-large`.
 
-### Carga por bloques y medición
+### Block loading and benchmark
 
-La implementación actual valida registros en orden, copia cada bloque de
-10.000 filas a una tabla temporal con `COPY` y clasifica duplicados, conflictos
-e inserciones con SQL de conjunto. Cada bloque y su checkpoint se confirman en
-una transacción. `--workers` paraleliza la validación sin alterar el orden de
-confirmación. Los puntos de control anteriores se pueden continuar con esta
-versión; los registros de progreso pendientes se absorben al confirmar el
-bloque correspondiente.
+The current loader validates records in order, copies each 10,000-record block
+to a temporary table with `COPY`, and classifies duplicates, conflicts, and
+inserts with set-based SQL. Each block and its checkpoint commit in one
+transaction. `--workers` parallelizes validation without changing commit
+order. Checkpoints written by the previous loader remain resumable.
 
-Medición local con 400.000 registros generados, cuatro workers y una base de
-datos aislada con los siete índices del esquema: **215,46 s** (3 min 35 s),
-**396.241 filas insertadas**, 3.035 rechazadas, 362 duplicados exactos y 362
-conflictos. La base de prueba ocupó 251 MB. Esto equivale a unas 1.839 filas
-insertadas por segundo. La medición anterior comunicada para 400.000 registros
-fue de **más de cinco minutos**; no fue una ejecución controlada en la misma
-base, por lo que la comparación es orientativa. La base temporal de esta
-medición se eliminó al terminar.
+A local run with 400,000 generated records, four workers, and an isolated
+database with all seven schema indexes took **215.46 seconds** (3 minutes
+35 seconds). It inserted **396,241 rows**, rejected 3,035, found 362 exact
+duplicates and 362 ID conflicts. The test database used 251 MB. Throughput
+was about 1,839 inserted rows per second. An earlier, uncontrolled run was
+reported to take more than five minutes for 400,000 records, so that
+comparison is indicative rather than a controlled speedup measurement. The
+isolated database was removed after the benchmark.
 
 ## Part 1 — Loading the coffee health dataset
 
@@ -123,26 +115,24 @@ important than filtered reads, I would keep `country`, `age` and
 
 ### Loader design
 
-`scripts/load_data.py` invoca `app.coffee.cli` y el importador por bloques:
+`scripts/load_data.py` calls `app.coffee.cli` and the block importer:
 
-1. `csv.reader` recorre el archivo una vez; solo se mantienen 10.000 registros
-   por bloque en memoria.
-2. La validación se ejecuta con el número de hilos indicado por `--workers`.
-   Los resultados se conservan en el orden original del CSV.
-3. Cada bloque se copia a una tabla temporal con `COPY`. PostgreSQL clasifica
-   duplicados exactos, conflictos, registros ya cargados y filas nuevas con
-   operaciones de conjunto.
-4. Las inserciones, los rechazos y el checkpoint del bloque se confirman en una
-   misma transacción. Una interrupción permite volver a procesar el último
-   bloque incompleto sin duplicar resultados.
-5. Si un bloque provoca un error de datos en PostgreSQL, se divide hasta aislar
-   el registro problemático y reportarlo como rechazado.
+1. `csv.reader` streams the file; at most one 10,000-record block is held for
+   validation at a time.
+2. The number of threads selected by `--workers` validates the records while
+   preserving their original CSV order.
+3. Each block is copied to a temporary table with `COPY`. PostgreSQL uses
+   set-based operations to classify exact duplicates, ID conflicts, rows
+   already loaded, and new rows.
+4. Inserts, rejections, and the block checkpoint commit in one transaction.
+   An interrupted block can be retried without duplicating results.
+5. If a block causes a PostgreSQL data error, it is split until the offending
+   record can be rejected individually.
 
-La primera fila válida para cada ID gana incluso cuando las apariciones caen en
-bloques distintos. `coffee_load_seen` conserva la primera fila normalizada,
-`coffee_load_checkpoint` almacena el avance y `coffee_load_reject` permite
-exportar `errores.csv`. El lector vuelve a recorrer el CSV desde el principio
-al reanudar, pero omite los bloques anteriores al checkpoint.
+The first valid occurrence of an ID wins across block boundaries.
+`coffee_load_seen` stores its normalized values, `coffee_load_checkpoint`
+stores progress, and `coffee_load_reject` supplies `errores.csv`. On resume,
+the reader scans the CSV from the start but skips blocks before the checkpoint.
 
 ### Normalization and rejection rules
 
@@ -243,15 +233,15 @@ Run them with `make test`; the database must be running and the schema applied.
 
 ### Scale notes for the loader
 
-- La memoria de Python está acotada por el bloque de 10.000 registros y el
-  número de workers; el tamaño del CSV no se carga completo en memoria.
-- La carga actualiza los siete índices de `coffee_health` y la tabla
-  `coffee_load_seen`. Ambos costes aumentan con los datos almacenados.
-- Cada bloque crea tablas temporales, ejecuta `COPY` y confirma una transacción.
-  El procesamiento por bloques reduce las consultas individuales por fila;
-  el rendimiento real debe medirse en el equipo de destino.
-- La reanudación conserva el estado de la base, pero vuelve a leer el CSV desde
-  el inicio para localizar el primer bloque pendiente.
+- Python memory is bounded by a 10,000-record block and the worker count;
+  the full CSV is never loaded into memory.
+- Imports update seven `coffee_health` indexes and `coffee_load_seen`.
+  Both costs grow with stored data.
+- Each block creates temporary tables, uses `COPY`, and commits one
+  transaction. Set-based processing reduces per-row database round trips;
+  throughput still needs to be measured on the target machine.
+- Resume preserves database state but scans the CSV from the beginning to
+  find the first pending block.
 
 ## Part 2 — API
 
@@ -371,50 +361,23 @@ the same filters as `/coffee`; an unknown `group_by` returns `422`.
 
 ## Part 3 — Tests and code quality
 
-### Tests by file
+### Tests
 
-**Unit tests (no database).** `make test-unit` runs only `tests/unit`; these
-tests pass with an unreachable `DATABASE_URL`. **70 tests.**
-
-| Archivo | Funcionalidad | Posibilidades |
-|---|---|---|
-| `tests/unit/test_normalization.py` (30) | Valida, normaliza y rechaza filas del CSV usando solo funciones puras. | Fila limpia sin correcciones; espacios y mayúsculas; booleanos `YES`/`no` y `0`/`1`; decimales con coma `7,5`; sufijos `3.5 cups`; números inválidos `seven`, `4O`, vacío; no enteros; booleanos inválidos `-1`, `2`; café sin cafeína; cafeína residual ≤ 10 mg; café 0 con cafeína alta; rangos de edad, BMI y pulso; categóricos inválidos; columnas faltantes o extra; fixture sucio completo. |
-| `tests/unit/test_filters.py` (17) | Valida el query model Pydantic reutilizando la normalización del loader. | Normalización de caso y espacios; deduplicación; defaults `limit=50` y `after_id=None`; límites `limit` 0/201 y `after_id` 0; categórico inválido; valores fuera de los rangos de la base; `min > max` para edad, café, BMI y sueño. |
-| `tests/unit/test_chunks.py` (22) | Planifica la carga paralela: conteo de líneas, rangos y offsets de bytes. | Cobertura exacta sin solapes para 1–1000 líneas y 1–16 workers; reparto del resto; archivo vacío o solo cabecera; línea final sin salto; detección de registros multilínea (comillas en una sola línea no fuerzan secuencial); offsets al inicio de cada chunk; tope de workers por número de líneas; resolución `auto` bajo/sobre el umbral y tope de CPU; merge de logs en orden. |
-| `tests/unit/test_mapping.py` (1) | Comprueba que `to_db_row` respeta el orden de columnas de la base. | Registro completo con decimales y booleanos. |
-
-**Integration tests (real PostgreSQL).** `make test-integration` runs
-`tests/integration`; `make test` runs both suites. **30 tests.**
-
-| Archivo | Funcionalidad | Posibilidades |
-|---|---|---|
-| `tests/integration/test_coffee_api.py` (26) | Prueba `/coffee`, `/coffee/{record_id}` y `/coffee/summary` con `TestClient` contra PostgreSQL real. | País case-insensitive; filtros categóricos + rango; rangos numéricos y booleanos; keyset pagination; página vacía; inyección SQL; forma completa del registro; lectura de un registro y coincidencia con el elemento de la lista; `404` inexistente; `422` por ID `0`, negativo o no numérico, rangos invertidos, valores fuera de rango, categórico inválido, `limit` y `after_id`; error que nombra `min_age`; resumen por género y país con filtros; `group_by` inválido. |
-| `tests/integration/test_health.py` (2) | Verifica la salud de la app y el montaje del router. | `/health` responde `200` con base de datos; `/coffee` responde con la estructura esperada. |
-| `tests/integration/test_loader.py` (2) | Verifica idempotencia, conflictos y equivalencia del modo paralelo. | Primera carga; segunda carga sin cambios; duplicado exacto; conflicto de ID (gana la primera); filas rechazadas; log JSONL; limpieza de filas de prueba; `workers=1` vs `workers=4` con el mismo resumen y el mismo log. |
-
-Total: **70 unitarios + 30 de integración = 100 tests**.
+`make test-unit` runs normalization, filter, mapping, CSV reader, and worker
+unit tests without PostgreSQL. `make test-integration` runs API and importer
+tests against a real PostgreSQL instance. Importer integration tests cover
+idempotency, rejection reporting, exact duplicates and conflicts across
+blocks, equal results with one or multiple validation workers, interruption
+and resume, and compatibility with previous checkpoints. `make test` runs both
+suites. The latest full run passed **86 tests**.
 
 ### Pre-commit hook
 
-The hook is versioned at `.githooks/pre-commit`. `make setup` (or `make hooks`)
-configures it with:
-
-```bash
-git config core.hooksPath .githooks
-chmod +x .githooks/pre-commit
-```
-
-Before every commit it runs:
-
-```bash
-uv run pytest tests/unit -q
-```
-
-So a commit is blocked if normalization, filter validation, chunk planning or
-mapping breaks, and the hook never needs the database. The full suite and the
-linter remain explicit commands (`make test`, `make lint`).
+`make setup` installs the versioned `.githooks/pre-commit` hook. It runs the
+unit tests before each commit. The full suite and linter remain explicit
+commands (`make test` and `make lint`).
 
 ### Type checking
 
-`make lint` runs `ruff check`, `ruff format --check` and `mypy` in strict mode.
-Both the application and the tests are typed.
+`make lint` runs `ruff check`, `ruff format --check`, and strict `mypy` for
+application code and tests.
